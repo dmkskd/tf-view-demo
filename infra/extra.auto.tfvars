@@ -1,1 +1,2 @@
 app = true
+legacy = false
