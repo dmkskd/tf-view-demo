@@ -1,380 +1,486 @@
-# Web-app stack for the Atlantis demo. Runs against Floci (local AWS emulator), no AWS account needed.
+########################################################################
+# Atlantis demo stack: AWS + ClickHouse Cloud with an S3 ClickPipe, applied
+# for real. A copy of samples/aws-clickhouse-s3-clickpipe with local state in the
+# volume the demo's containers share, and the variables the demo MR sets.
+#
+# Data path:
+#   EC2 producer -> S3 (gateway endpoint) -> S3 event -> SQS
+#   ClickPipe (IAM role) <- SQS notification, reads the object -> events table
+# Query path:
+#   EC2 -> interface VPC endpoint (PrivateLink) -> ClickHouse service
+#
+# Credentials:
+#   AWS:        default credential chain.
+#   ClickHouse: CLICKHOUSE_ORG_ID, CLICKHOUSE_CLOUD_API_KEY,
+#               CLICKHOUSE_CLOUD_API_SECRET (just loads ~/.clickhouse.env).
+########################################################################
+
 terraform {
+  required_version = ">= 1.11" # password_wo
+
+  # the demo's base and atlantis containers mount the same volume at /state
+  backend "local" {
+    path = "/state/terraform.tfstate"
+  }
+
   required_providers {
-    aws = { source = "hashicorp/aws", version = "~> 5.0" }
-  }
-  # State lives in Floci's S3 so it survives between merge requests (setup creates the bucket).
-  backend "s3" {
-    bucket                      = "tfstate"
-    key                         = "demo/terraform.tfstate"
-    region                      = "us-east-1"
-    access_key                  = "test"
-    secret_key                  = "test"
-    endpoints                   = { s3 = "http://floci:4566" }
-    use_path_style              = true
-    skip_credentials_validation = true
-    skip_requesting_account_id  = true
-    skip_metadata_api_check     = true
-    skip_region_validation      = true
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    clickhouse = {
+      source  = "ClickHouse/clickhouse"
+      version = "~> 3.39"
+    }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.12"
+    }
   }
 }
 
-# The platform (network, load balancer, database, sessions table, a legacy bucket) is applied once at `just up`.
-# The MR then builds the app on top of it by switching these on, changing one setting and removing the legacy bucket.
-variable "app" {
-  description = "App tier: IAM role, launch template, auto scaling group, log group."
+variable "region" {
+  description = "AWS region, also used for the ClickHouse service"
+  default     = "us-east-1"
+}
+
+variable "name" {
+  default = "tfpv-demo"
+}
+
+# Set by the demo MR (shared-clickhouse/revisions.sh), in extra.auto.tfvars.
+variable "reporting" {
+  description = "Add a read-only reporting service to the warehouse, reached over the same VPC endpoint"
   type        = bool
   default     = false
 }
 
-variable "storage" {
-  description = "Assets bucket and the app's read access to it."
-  type        = bool
-  default     = false
-}
-
-variable "messaging" {
-  description = "SNS topic and SQS queue, subscribed to each other."
-  type        = bool
-  default     = false
-}
-
-variable "legacy" {
-  description = "Old export bucket that already exists; switching it off deletes it."
-  type        = bool
-  default     = true
-}
-
-variable "health_path" {
-  description = "Health check path of the load balancer's target group; changing it is an in-place update."
-  type        = string
-  default     = "/"
-}
-
-variable "db_password" {
-  description = "Demo database password (fake, local only)."
-  type        = string
-  default     = "change-me-demo"
-  sensitive   = true
-}
-
-variable "endpoint" {
-  type    = string
-  default = "http://floci:4566"
-}
-
-locals {
-  endpoint = var.endpoint
+variable "writer_replicas" {
+  type    = number
+  default = 3
 }
 
 provider "aws" {
-  region                      = "us-east-1"
-  access_key                  = "test"
-  secret_key                  = "test"
-  skip_credentials_validation = true
-  skip_requesting_account_id  = true
-  skip_metadata_api_check     = true
-  s3_use_path_style           = true
-  endpoints {
-    ec2            = local.endpoint
-    s3             = local.endpoint
-    sqs            = local.endpoint
-    sns            = local.endpoint
-    iam            = local.endpoint
-    sts            = local.endpoint
-    kms            = local.endpoint
-    elbv2          = local.endpoint
-    rds            = local.endpoint
-    autoscaling    = local.endpoint
-    cloudwatchlogs = local.endpoint
-    dynamodb       = local.endpoint
+  region = var.region
+  default_tags {
+    tags = { Project = var.name }
   }
 }
 
-# ---------------------------------------------------------------- platform: network
+provider "clickhouse" {}
+
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+########################################################################
+# AWS networking
+########################################################################
+
 resource "aws_vpc" "main" {
-  cidr_block = "10.0.0.0/16"
-  tags       = { Name = "demo" }
-}
-
-resource "aws_subnet" "public_a" {
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = "10.0.1.0/24"
-  availability_zone = "us-east-1a"
-  tags              = { Name = "demo-public-a" }
-}
-
-resource "aws_subnet" "public_b" {
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = "10.0.2.0/24"
-  availability_zone = "us-east-1b"
-  tags              = { Name = "demo-public-b" }
-}
-
-resource "aws_subnet" "private_a" {
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = "10.0.11.0/24"
-  availability_zone = "us-east-1a"
-  tags              = { Name = "demo-private-a" }
-}
-
-resource "aws_subnet" "private_b" {
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = "10.0.12.0/24"
-  availability_zone = "us-east-1b"
-  tags              = { Name = "demo-private-b" }
+  cidr_block           = "10.44.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  tags                 = { Name = var.name }
 }
 
 resource "aws_internet_gateway" "main" {
   vpc_id = aws_vpc.main.id
-  tags   = { Name = "demo" }
 }
 
-resource "aws_eip" "nat" {
-  domain = "vpc"
-  tags   = { Name = "demo-nat" }
-}
-
-resource "aws_nat_gateway" "main" {
-  allocation_id = aws_eip.nat.id
-  subnet_id     = aws_subnet.public_a.id
-  tags          = { Name = "demo" }
-  depends_on    = [aws_internet_gateway.main]
+resource "aws_subnet" "public" {
+  count             = 2
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = cidrsubnet(aws_vpc.main.cidr_block, 8, count.index)
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+  tags              = { Name = "${var.name}-public-${count.index}" }
 }
 
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
-  tags   = { Name = "demo-public" }
   route {
     cidr_block = "0.0.0.0/0"
     gateway_id = aws_internet_gateway.main.id
   }
 }
 
-resource "aws_route_table" "private" {
-  vpc_id = aws_vpc.main.id
-  tags   = { Name = "demo-private" }
-  route {
-    cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.main.id
-  }
-}
-
-resource "aws_route_table_association" "public_a" {
-  subnet_id      = aws_subnet.public_a.id
+resource "aws_route_table_association" "public" {
+  count          = 2
+  subnet_id      = aws_subnet.public[count.index].id
   route_table_id = aws_route_table.public.id
 }
 
-resource "aws_route_table_association" "public_b" {
-  subnet_id      = aws_subnet.public_b.id
-  route_table_id = aws_route_table.public.id
+# S3 traffic from the VPC stays on the AWS network.
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.${var.region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.public.id]
+  tags              = { Name = "${var.name}-s3" }
 }
 
-resource "aws_route_table_association" "private_a" {
-  subnet_id      = aws_subnet.private_a.id
-  route_table_id = aws_route_table.private.id
+########################################################################
+# EC2 client: produces events to S3, queries ClickHouse. SSM only.
+########################################################################
+
+resource "aws_security_group" "client" {
+  name        = "${var.name}-client"
+  description = "Producer and ClickHouse client, egress only"
+  vpc_id      = aws_vpc.main.id
 }
 
-resource "aws_route_table_association" "private_b" {
-  subnet_id      = aws_subnet.private_b.id
-  route_table_id = aws_route_table.private.id
+resource "aws_vpc_security_group_egress_rule" "client_all" {
+  security_group_id = aws_security_group.client.id
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "-1"
 }
 
-# ---------------------------------------------------------------- platform: security groups
-resource "aws_security_group" "alb" {
-  name   = "demo-alb"
-  vpc_id = aws_vpc.main.id
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-
-resource "aws_security_group" "app" {
-  name   = "demo-app"
-  vpc_id = aws_vpc.main.id
-  ingress {
-    from_port       = 8080
-    to_port         = 8080
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb.id]
-  }
-}
-
-resource "aws_security_group" "db" {
-  name   = "demo-db"
-  vpc_id = aws_vpc.main.id
-  ingress {
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.app.id]
-  }
-}
-
-# ---------------------------------------------------------------- platform: load balancer
-resource "aws_lb" "main" {
-  name               = "demo-alb"
-  load_balancer_type = "application"
-  subnets            = [aws_subnet.public_a.id, aws_subnet.public_b.id]
-  security_groups    = [aws_security_group.alb.id]
-}
-
-resource "aws_lb_target_group" "app" {
-  name     = "demo-app"
-  port     = 8080
-  protocol = "HTTP"
-  vpc_id   = aws_vpc.main.id
-  health_check {
-    path = var.health_path
-  }
-}
-
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.main.arn
-  port              = 80
-  protocol          = "HTTP"
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.app.arn
-  }
-}
-
-# ---------------------------------------------------------------- platform: data
-resource "aws_db_subnet_group" "main" {
-  name       = "demo-db"
-  subnet_ids = [aws_subnet.private_a.id, aws_subnet.private_b.id]
-}
-
-resource "aws_db_instance" "main" {
-  identifier             = "demo-db"
-  engine                 = "postgres"
-  instance_class         = "db.t3.micro"
-  allocated_storage      = 20
-  username               = "demo"
-  password               = var.db_password
-  db_subnet_group_name   = aws_db_subnet_group.main.name
-  vpc_security_group_ids = [aws_security_group.db.id]
-  skip_final_snapshot    = true
-}
-
-resource "aws_dynamodb_table" "sessions" {
-  name         = "demo-sessions"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "id"
-  attribute {
-    name = "id"
-    type = "S"
-  }
-}
-
-# A legacy bucket that already exists and that the MR removes
-resource "aws_s3_bucket" "legacy" {
-  count  = var.legacy ? 1 : 0
-  bucket = "demo-legacy-exports"
-  tags   = { Name = "demo-legacy-exports" }
-}
-
-# ---------------------------------------------------------------- added by the MR: the app
-resource "aws_cloudwatch_log_group" "app" {
-  count = var.app ? 1 : 0
-  name  = "/demo/app"
-}
-
-resource "aws_iam_role" "app" {
-  count = var.app ? 1 : 0
-  name  = "demo-app"
+resource "aws_iam_role" "client" {
+  name = "${var.name}-client"
   assume_role_policy = jsonencode({
-    Version   = "2012-10-17"
-    Statement = [{ Effect = "Allow", Principal = { Service = "ec2.amazonaws.com" }, Action = "sts:AssumeRole" }]
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
   })
 }
 
-resource "aws_iam_instance_profile" "app" {
-  count = var.app ? 1 : 0
-  name  = "demo-app"
-  role  = aws_iam_role.app[0].name
+resource "aws_iam_role_policy_attachment" "client_ssm" {
+  role       = aws_iam_role.client.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-resource "aws_launch_template" "app" {
-  count                  = var.app ? 1 : 0
-  name                   = "demo-app"
-  image_id               = "ami-12345678"
-  instance_type          = "t3.micro"
-  vpc_security_group_ids = [aws_security_group.app.id]
-  iam_instance_profile {
-    name = aws_iam_instance_profile.app[0].name
-  }
-}
-
-resource "aws_autoscaling_group" "app" {
-  count               = var.app ? 1 : 0
-  name                = "demo-app"
-  min_size            = 1
-  max_size            = 2
-  vpc_zone_identifier = [aws_subnet.private_a.id, aws_subnet.private_b.id]
-  target_group_arns   = [aws_lb_target_group.app.arn]
-  launch_template {
-    id      = aws_launch_template.app[0].id
-    version = "$Latest"
-  }
-}
-
-# ---------------------------------------------------------------- added by the MR: storage
-resource "aws_s3_bucket" "assets" {
-  count  = var.storage ? 1 : 0
-  bucket = "demo-assets"
-}
-
-resource "aws_s3_bucket_versioning" "assets" {
-  count  = var.storage ? 1 : 0
-  bucket = aws_s3_bucket.assets[0].id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-resource "aws_iam_role_policy" "assets_read" {
-  count = var.app && var.storage ? 1 : 0
-  name  = "assets-read"
-  role  = aws_iam_role.app[0].id
+resource "aws_iam_role_policy" "client_produce" {
+  name = "produce-events"
+  role = aws_iam_role.client.id
   policy = jsonencode({
-    Version   = "2012-10-17"
-    Statement = [{ Effect = "Allow", Action = ["s3:GetObject", "s3:ListBucket"], Resource = [aws_s3_bucket.assets[0].arn, "${aws_s3_bucket.assets[0].arn}/*"] }]
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "s3:PutObject"
+      Resource = "${aws_s3_bucket.events.arn}/events/*"
+    }]
   })
 }
 
-# ---------------------------------------------------------------- added by the MR: messaging
-resource "aws_sns_topic" "alerts" {
-  count = var.messaging ? 1 : 0
-  name  = "demo-alerts"
+resource "aws_iam_instance_profile" "client" {
+  name = "${var.name}-client"
+  role = aws_iam_role.client.name
 }
 
-resource "aws_sqs_queue" "jobs" {
-  count = var.messaging ? 1 : 0
-  name  = "demo-jobs"
+data "aws_ssm_parameter" "al2023_arm64" {
+  name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
 }
 
-resource "aws_sns_topic_subscription" "jobs" {
-  count     = var.messaging ? 1 : 0
-  topic_arn = aws_sns_topic.alerts[0].arn
-  protocol  = "sqs"
-  endpoint  = aws_sqs_queue.jobs[0].arn
+resource "aws_instance" "client" {
+  ami                         = data.aws_ssm_parameter.al2023_arm64.value
+  instance_type               = "t4g.micro" # free tier
+  subnet_id                   = aws_subnet.public[0].id
+  associate_public_ip_address = true # SSM agent reaches SSM over the internet
+  vpc_security_group_ids      = [aws_security_group.client.id]
+  iam_instance_profile        = aws_iam_instance_profile.client.name
+  tags                        = { Name = "${var.name}-client" }
+
+  lifecycle {
+    ignore_changes = [ami]
+  }
 }
 
-resource "aws_sqs_queue_policy" "jobs" {
-  count     = var.messaging ? 1 : 0
-  queue_url = aws_sqs_queue.jobs[0].id
+########################################################################
+# ClickHouse Cloud service
+########################################################################
+
+resource "clickhouse_service" "main" {
+  name           = var.name
+  cloud_provider = "aws"
+  region         = var.region
+
+  # Empty password_wo asks ClickHouse to generate one (see generated_password).
+  password_wo         = ""
+  password_wo_version = 1
+
+  # PrivateLink only.
+  ip_access = []
+
+  autoscaling_mode      = "vertical"
+  num_replicas          = var.writer_replicas
+  min_replica_memory_gb = 8
+  max_replica_memory_gb = 8
+  idle_scaling          = true
+  idle_timeout_minutes  = 5
+  release_channel       = "default"
+  enable_core_dumps     = true
+
+  backup_configuration = {
+    backup_period_in_hours           = 24
+    backup_retention_period_in_hours = 24
+  }
+
+  endpoints = {
+    mysql = { enabled = false }
+  }
+}
+
+########################################################################
+# AWS -> ClickHouse: PrivateLink
+########################################################################
+
+resource "aws_security_group" "clickhouse_endpoint" {
+  name        = "${var.name}-clickhouse-endpoint"
+  description = "Interface endpoint to ClickHouse Cloud"
+  vpc_id      = aws_vpc.main.id
+}
+
+resource "aws_vpc_security_group_ingress_rule" "clickhouse_https" {
+  security_group_id            = aws_security_group.clickhouse_endpoint.id
+  referenced_security_group_id = aws_security_group.client.id
+  ip_protocol                  = "tcp"
+  from_port                    = 8443
+  to_port                      = 8443
+  description                  = "ClickHouse HTTPS"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "clickhouse_native" {
+  security_group_id            = aws_security_group.clickhouse_endpoint.id
+  referenced_security_group_id = aws_security_group.client.id
+  ip_protocol                  = "tcp"
+  from_port                    = 9440
+  to_port                      = 9440
+  description                  = "ClickHouse native protocol (TLS)"
+}
+
+resource "aws_vpc_endpoint" "clickhouse" {
+  vpc_id              = aws_vpc.main.id
+  service_name        = clickhouse_service.main.private_endpoint_config.endpoint_service_id
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = aws_subnet.public[*].id
+  security_group_ids  = [aws_security_group.clickhouse_endpoint.id]
+  private_dns_enabled = false
+  tags                = { Name = "${var.name}-clickhouse" }
+}
+
+resource "aws_route53_zone" "clickhouse" {
+  name = "${var.region}.vpce.aws.clickhouse.cloud"
+  vpc {
+    vpc_id = aws_vpc.main.id
+  }
+}
+
+resource "aws_route53_record" "clickhouse" {
+  zone_id = aws_route53_zone.clickhouse.zone_id
+  name    = clickhouse_service.main.private_endpoint_config.private_dns_hostname
+  type    = "CNAME"
+  ttl     = 300
+  records = [aws_vpc_endpoint.clickhouse.dns_entry[0].dns_name]
+}
+
+resource "clickhouse_service_private_endpoints_attachment" "main" {
+  service_id           = clickhouse_service.main.id
+  private_endpoint_ids = [aws_vpc_endpoint.clickhouse.id]
+}
+
+########################################################################
+# Read-only reporting service: shares the warehouse (the data), with its own
+# replicas and endpoint. Private access is per service, so it registers the
+# same VPC endpoint and gets its own private hostname record.
+########################################################################
+
+resource "clickhouse_service" "reporting" {
+  count          = var.reporting ? 1 : 0
+  name           = "${var.name}-reporting"
+  cloud_provider = "aws"
+  region         = var.region
+  warehouse_id   = clickhouse_service.main.warehouse_id
+  readonly       = true
+
+  password_wo         = ""
+  password_wo_version = 1
+
+  ip_access = []
+
+  autoscaling_mode      = "vertical"
+  num_replicas          = 2
+  min_replica_memory_gb = 8
+  max_replica_memory_gb = 8
+  idle_scaling          = true
+  idle_timeout_minutes  = 5
+  release_channel       = "default"
+}
+
+resource "clickhouse_service_private_endpoints_attachment" "reporting" {
+  count                = var.reporting ? 1 : 0
+  service_id           = clickhouse_service.reporting[0].id
+  private_endpoint_ids = [aws_vpc_endpoint.clickhouse.id]
+}
+
+resource "aws_route53_record" "clickhouse_reporting" {
+  count   = var.reporting ? 1 : 0
+  zone_id = aws_route53_zone.clickhouse.zone_id
+  name    = clickhouse_service.reporting[0].private_endpoint_config.private_dns_hostname
+  type    = "CNAME"
+  ttl     = 300
+  records = [aws_vpc_endpoint.clickhouse.dns_entry[0].dns_name]
+}
+
+########################################################################
+# S3 events: bucket, SQS notifications
+########################################################################
+
+resource "aws_s3_bucket" "events" {
+  bucket_prefix = "${var.name}-events-"
+  force_destroy = true
+}
+
+resource "aws_sqs_queue" "events" {
+  name                       = "${var.name}-events"
+  visibility_timeout_seconds = 300
+  message_retention_seconds  = 86400
+}
+
+resource "aws_sqs_queue_policy" "events" {
+  queue_url = aws_sqs_queue.events.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Effect    = "Allow"
-      Principal = "*"
+      Principal = { Service = "s3.amazonaws.com" }
       Action    = "sqs:SendMessage"
-      Resource  = aws_sqs_queue.jobs[0].arn
-      Condition = { ArnEquals = { "aws:SourceArn" = aws_sns_topic.alerts[0].arn } }
+      Resource  = aws_sqs_queue.events.arn
+      Condition = { ArnEquals = { "aws:SourceArn" = aws_s3_bucket.events.arn } }
     }]
   })
+}
+
+resource "aws_s3_bucket_notification" "events" {
+  bucket = aws_s3_bucket.events.id
+  queue {
+    queue_arn     = aws_sqs_queue.events.arn
+    events        = ["s3:ObjectCreated:*"]
+    filter_prefix = "events/"
+    filter_suffix = ".json"
+  }
+  depends_on = [aws_sqs_queue_policy.events]
+}
+
+# One file so the initial load has data.
+resource "aws_s3_object" "seed" {
+  bucket       = aws_s3_bucket.events.id
+  key          = "events/0000-seed.json"
+  content_type = "application/json"
+  content      = <<-EOT
+    {"id":"seed-1","ts":"2026-01-01 00:00:00.000","event_type":"signup","user_id":1,"value":0}
+    {"id":"seed-2","ts":"2026-01-01 00:00:01.000","event_type":"login","user_id":1,"value":0}
+  EOT
+  depends_on   = [aws_s3_bucket_notification.events]
+}
+
+########################################################################
+# ClickPipe: S3 -> events table, IAM role
+########################################################################
+
+resource "aws_iam_role" "clickpipes" {
+  name = "${var.name}-clickpipes"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { AWS = clickhouse_service.main.iam_role }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "clickpipes" {
+  name = "read-events"
+  role = aws_iam_role.clickpipes.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"]
+        Resource = [aws_s3_bucket.events.arn, "${aws_s3_bucket.events.arn}/*"]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes", "sqs:GetQueueUrl"]
+        Resource = aws_sqs_queue.events.arn
+      },
+    ]
+  })
+}
+
+# IAM is eventually consistent; ClickPipes checks access at creation.
+resource "time_sleep" "clickpipes_iam" {
+  create_duration = "20s"
+  depends_on      = [aws_iam_role_policy.clickpipes]
+}
+
+resource "clickhouse_clickpipe" "events" {
+  name       = "S3 events"
+  service_id = clickhouse_service.main.id
+  depends_on = [time_sleep.clickpipes_iam, aws_s3_object.seed]
+
+  source = {
+    object_storage = {
+      type           = "s3"
+      format         = "JSONEachRow"
+      url            = "https://${aws_s3_bucket.events.bucket_regional_domain_name}/events/*.json"
+      is_continuous  = true
+      queue_url      = aws_sqs_queue.events.url
+      authentication = "IAM_ROLE"
+      iam_role       = aws_iam_role.clickpipes.arn
+    }
+  }
+
+  destination = {
+    table         = "events"
+    managed_table = true
+    table_definition = {
+      engine      = { type = "MergeTree" }
+      sorting_key = ["event_type", "ts"]
+    }
+    columns = [
+      { name = "id", type = "String" },
+      { name = "ts", type = "DateTime64(3)" },
+      { name = "event_type", type = "LowCardinality(String)" },
+      { name = "user_id", type = "UInt32" },
+      { name = "value", type = "Float64" },
+    ]
+  }
+
+  field_mappings = [
+    { source_field = "id", destination_field = "id" },
+    { source_field = "ts", destination_field = "ts" },
+    { source_field = "event_type", destination_field = "event_type" },
+    { source_field = "user_id", destination_field = "user_id" },
+    { source_field = "value", destination_field = "value" },
+  ]
+}
+
+########################################################################
+# Outputs
+########################################################################
+
+output "client_instance_id" {
+  value = aws_instance.client.id
+}
+
+output "clickhouse_host" {
+  value = clickhouse_service.main.private_endpoint_config.private_dns_hostname
+}
+
+output "clickhouse_password" {
+  value     = clickhouse_service.main.generated_password
+  sensitive = true
+}
+
+output "events_bucket" {
+  value = aws_s3_bucket.events.bucket
+}
+
+output "clickpipe_state" {
+  value = clickhouse_clickpipe.events.state
 }
