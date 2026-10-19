@@ -50,12 +50,6 @@ variable "name" {
 
 # Set by the demo MR (shared-clickhouse/revisions.sh), in extra.auto.tfvars,
 # one per commit.
-variable "upgrade_window" {
-  description = "Upgrade the writer on Sunday mornings"
-  type        = bool
-  default     = false
-}
-
 variable "reporting" {
   description = "Add a read-only reporting service to the warehouse, reached over the same VPC endpoint"
   type        = bool
@@ -67,16 +61,20 @@ variable "writer_replicas" {
   default = 3
 }
 
-variable "clicks_pipe" {
-  description = "A second S3 ClickPipe for click events under clicks/"
-  type        = bool
-  default     = false
+variable "writer_idle_minutes" {
+  type    = number
+  default = 5
 }
 
-variable "events_dlq" {
-  description = "A dead-letter queue for S3 event notifications the ClickPipe cannot process"
+variable "client_instance_type" {
+  type    = string
+  default = "t4g.micro"
+}
+
+variable "events_sort_by_type" {
+  description = "Sort the events table by event_type, then ts; false sorts by ts only"
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "seed" {
@@ -201,7 +199,7 @@ data "aws_ssm_parameter" "al2023_arm64" {
 
 resource "aws_instance" "client" {
   ami                         = data.aws_ssm_parameter.al2023_arm64.value
-  instance_type               = "t4g.micro" # free tier
+  instance_type               = var.client_instance_type
   subnet_id                   = aws_subnet.public[0].id
   associate_public_ip_address = true # SSM agent reaches SSM over the internet
   vpc_security_group_ids      = [aws_security_group.client.id]
@@ -234,7 +232,7 @@ resource "clickhouse_service" "main" {
   min_replica_memory_gb = 8
   max_replica_memory_gb = 8
   idle_scaling          = true
-  idle_timeout_minutes  = 5
+  idle_timeout_minutes  = var.writer_idle_minutes
   release_channel       = "default"
   enable_core_dumps     = true
 
@@ -306,13 +304,6 @@ resource "clickhouse_service_private_endpoints_attachment" "main" {
   private_endpoint_ids = [aws_vpc_endpoint.clickhouse.id]
 }
 
-resource "clickhouse_service_upgrade_window" "main" {
-  count          = var.upgrade_window ? 1 : 0
-  service_id     = clickhouse_service.main.id
-  weekday        = 0 # Sunday
-  start_hour_utc = 6
-}
-
 ########################################################################
 # Read-only reporting service: shares the warehouse (the data), with its own
 # replicas and endpoint. Private access is per service, so it registers the
@@ -369,16 +360,6 @@ resource "aws_sqs_queue" "events" {
   name                       = "${var.name}-events"
   visibility_timeout_seconds = 300
   message_retention_seconds  = 86400
-  redrive_policy = var.events_dlq ? jsonencode({
-    deadLetterTargetArn = aws_sqs_queue.events_dlq[0].arn
-    maxReceiveCount     = 5
-  }) : null
-}
-
-resource "aws_sqs_queue" "events_dlq" {
-  count                     = var.events_dlq ? 1 : 0
-  name                      = "${var.name}-events-dlq"
-  message_retention_seconds = 1209600 # 14 days
 }
 
 resource "aws_sqs_queue_policy" "events" {
@@ -489,7 +470,7 @@ resource "clickhouse_clickpipe" "events" {
     managed_table = true
     table_definition = {
       engine      = { type = "MergeTree" }
-      sorting_key = ["event_type", "ts"]
+      sorting_key = var.events_sort_by_type ? ["event_type", "ts"] : ["ts"]
     }
     columns = [
       { name = "id", type = "String" },
@@ -506,49 +487,6 @@ resource "clickhouse_clickpipe" "events" {
     { source_field = "event_type", destination_field = "event_type" },
     { source_field = "user_id", destination_field = "user_id" },
     { source_field = "value", destination_field = "value" },
-  ]
-}
-
-########################################################################
-# Second ClickPipe: click events under clicks/, read in lexical order
-# (no queue), into their own table
-########################################################################
-
-resource "clickhouse_clickpipe" "clicks" {
-  count      = var.clicks_pipe ? 1 : 0
-  name       = "S3 clicks"
-  service_id = clickhouse_service.main.id
-  depends_on = [time_sleep.clickpipes_iam]
-
-  source = {
-    object_storage = {
-      type           = "s3"
-      format         = "JSONEachRow"
-      url            = "https://${aws_s3_bucket.events.bucket_regional_domain_name}/clicks/*.json"
-      is_continuous  = true
-      authentication = "IAM_ROLE"
-      iam_role       = aws_iam_role.clickpipes.arn
-    }
-  }
-
-  destination = {
-    table         = "clicks"
-    managed_table = true
-    table_definition = {
-      engine      = { type = "MergeTree" }
-      sorting_key = ["ts"]
-    }
-    columns = [
-      { name = "ts", type = "DateTime64(3)" },
-      { name = "user_id", type = "UInt32" },
-      { name = "url", type = "String" },
-    ]
-  }
-
-  field_mappings = [
-    { source_field = "ts", destination_field = "ts" },
-    { source_field = "user_id", destination_field = "user_id" },
-    { source_field = "url", destination_field = "url" },
   ]
 }
 
